@@ -107,7 +107,7 @@ class MeshVolumeCalculator {
     /// Calculate volume using signed tetrahedra decomposition
     /// For each triangle, form a tetrahedron with the origin
     /// V = (1/6) * Σ dot(a, cross(b, c))
-    nonisolated private static func calculateSignedTetrahedraVolume(triangles: [Triangle]) -> Double {
+    nonisolated static func calculateSignedTetrahedraVolume(triangles: [Triangle]) -> Double {
         var totalVolume: Double = 0.0
 
         for triangle in triangles {
@@ -128,7 +128,7 @@ class MeshVolumeCalculator {
 
     /// Calculate volume using surface integration
     /// Integrates z-component over projected area
-    nonisolated private static func calculateSurfaceIntegrationVolume(triangles: [Triangle]) -> Double {
+    nonisolated static func calculateSurfaceIntegrationVolume(triangles: [Triangle]) -> Double {
         var volume: Double = 0.0
 
         for triangle in triangles {
@@ -154,7 +154,7 @@ class MeshVolumeCalculator {
     // MARK: - Convex Hull Method (Fallback)
 
     /// Approximate volume using convex hull
-    nonisolated private static func calculateConvexHullVolume(triangles: [Triangle]) -> Double {
+    nonisolated static func calculateConvexHullVolume(triangles: [Triangle]) -> Double {
         // Extract all unique vertices
         var vertices = Set<SIMD3<Float>>()
         for triangle in triangles {
@@ -180,7 +180,7 @@ class MeshVolumeCalculator {
     // MARK: - Surface Area Calculation
 
     /// Calculate total surface area of mesh
-    nonisolated private static func calculateSurfaceArea(triangles: [Triangle]) -> Double {
+    nonisolated static func calculateSurfaceArea(triangles: [Triangle]) -> Double {
         var totalArea: Double = 0.0
 
         for triangle in triangles {
@@ -274,7 +274,7 @@ class MeshVolumeCalculator {
     // MARK: - Helper Methods
 
     /// Extract all triangles from mesh anchors
-    nonisolated private static func extractTriangles(from meshAnchors: [ARMeshAnchor]) -> [Triangle] {
+    nonisolated static func extractTriangles(from meshAnchors: [ARMeshAnchor]) -> [Triangle] {
         var triangles: [Triangle] = []
 
         for anchor in meshAnchors {

@@ -108,7 +108,8 @@ extension MeshVolumeCalculator {
             let transform = anchor.transform
 
             for i in 0..<geometry.faces.count {
-                let faceOffset = geometry.faces.offset + (i * geometry.faces.indexCountPerPrimitive * MemoryLayout<UInt32>.stride)
+                // ✅ ARGeometryElement has no offset property - data starts at buffer beginning
+                let faceOffset = i * geometry.faces.indexCountPerPrimitive * MemoryLayout<UInt32>.stride
 
                 guard faceOffset + (3 * MemoryLayout<UInt32>.stride) <= geometry.faces.buffer.length else {
                     continue

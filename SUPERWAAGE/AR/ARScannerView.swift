@@ -602,8 +602,8 @@ struct ARScannerView: UIViewRepresentable {
             }
 
             for i in 0..<faceCount {
-                // ✅ CRITICAL: Must include initial offset from faces
-                let faceIndex = faces.offset + (i * faces.indexCountPerPrimitive * MemoryLayout<UInt32>.stride)
+                // ✅ CRITICAL: ARGeometryElement has no offset property - data starts at buffer beginning
+                let faceIndex = i * faces.indexCountPerPrimitive * MemoryLayout<UInt32>.stride
 
                 // ✅ CRITICAL: Bounds check for face buffer
                 guard faceIndex + (faces.indexCountPerPrimitive * MemoryLayout<UInt32>.stride) <= faceBuffer.length else {
