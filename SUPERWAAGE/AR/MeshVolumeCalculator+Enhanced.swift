@@ -24,7 +24,7 @@ extension MeshVolumeCalculator {
     nonisolated static func calculateVolumeEnhanced(
         from meshAnchors: [ARMeshAnchor],
         applySmoothing: Bool = true,
-        smoothingConfig: MeshSmoothingEngine.SmoothingConfiguration = .moderate
+        smoothingConfig: MeshSmoothingEngine.SmoothingConfiguration = MeshSmoothingEngine.SmoothingConfiguration(iterations: 3, lambda: 0.5, preserveFeatures: true)
     ) -> EnhancedVolumeResult? {
         guard !meshAnchors.isEmpty else { return nil }
 
@@ -65,6 +65,15 @@ extension MeshVolumeCalculator {
         // Calculate surface area
         let surfaceArea = calculateSurfaceArea(triangles: allTriangles)
 
+        // ✅ CRITICAL FIX: Apply calibration scale factor
+        // Volume scales with the cube of linear scale factor (V = L³)
+        var calibratedVolume_m3 = volume_m3
+        if let calibrationFactor = CalibrationManager.shared.calibrationFactor {
+            let volumeScaleFactor = pow(Double(calibrationFactor), 3.0)
+            calibratedVolume_m3 = volume_m3 * volumeScaleFactor
+            print("📏 Enhanced calibration applied: raw=\(String(format: "%.2f", volume_m3 * 1_000_000)) cm³ → calibrated=\(String(format: "%.2f", calibratedVolume_m3 * 1_000_000)) cm³ (factor=\(String(format: "%.3f", calibrationFactor)))")
+        }
+
         // Calculate confidence based on smoothing and quality
         let confidence = calculateConfidence(
             qualityScore: qualityMetrics.qualityScore,
@@ -73,9 +82,9 @@ extension MeshVolumeCalculator {
         )
 
         return EnhancedVolumeResult(
-            volume_m3: volume_m3,
-            volume_cm3: volume_m3 * 1_000_000,
-            volume_ml: volume_m3 * 1_000_000,  // 1 cm³ = 1 ml
+            volume_m3: calibratedVolume_m3,
+            volume_cm3: calibratedVolume_m3 * 1_000_000,
+            volume_ml: calibratedVolume_m3 * 1_000_000,  // 1 cm³ = 1 ml
             surfaceArea_m2: surfaceArea,
             method: method,
             quality: qualityMetrics,

@@ -49,6 +49,9 @@ struct ARScannerView: UIViewRepresentable {
             configuration.videoFormat = format
         }
 
+        // ✅ AI: Configure AR session with AI enhancements
+        scanViewModel.aiCoordinator.configureARSession(configuration)
+
         // Configure lighting
         arView.environment.lighting.intensityExponent = 1.5
 
@@ -68,6 +71,9 @@ struct ARScannerView: UIViewRepresentable {
         if !context.coordinator.sessionStarted {
             context.coordinator.sessionStarted = true
             print("▶️ Starting AR session (first time)")
+
+            // Start diagnostic logging
+            context.coordinator.diagnosticLogger.sessionStarted()
 
             // Run session
             arView.session.run(configuration)
@@ -137,6 +143,29 @@ struct ARScannerView: UIViewRepresentable {
 
         // ✅ FIX: Prevent segmentation task stacking
         private var isProcessingSegmentation = false
+
+        // ✅ FIX: Prevent depth integration task stacking (ARFrame retention)
+        private var isProcessingDepthIntegration = false
+
+        // ✅ FIX: Prevent depth fallback task stacking (ARFrame retention)
+        private var isProcessingDepthFallback = false
+
+        // ✅ PRIMARY APPROACH: Direct depth-based point extraction (bypasses mesh anchor requirement)
+        private lazy var depthExtractor: DepthPointExtractor = {
+            let extractor = DepthPointExtractor()
+            // ✅ OPTIMIZED FOR PRIMARY USE: More aggressive sampling
+            extractor.depthSamplingRate = 3  // Sample every 3rd pixel (was 4) for higher point density
+            extractor.minConfidence = 0.4    // Lower threshold (was 0.5) to capture more points
+            extractor.maxDepth = 3.0         // Keep 3m max depth
+            extractor.minDepth = 0.05        // Reduce min depth to 5cm (was 10cm) for closer objects
+            return extractor
+        }()
+        private var useDepthPrimary = true  // ✅ NOW PRIMARY: Always enabled, not fallback
+        private var meshAnchorCheckTimer: Timer?
+        private var scanStartTime: Date?
+
+        // ✅ NEW: Diagnostic logging
+        let diagnosticLogger = ARDiagnosticLogger.shared
 
         init(scanViewModel: ScanViewModel) {
             self.scanViewModel = scanViewModel
@@ -233,14 +262,18 @@ struct ARScannerView: UIViewRepresentable {
                 if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
                     newConfig.frameSemantics.insert(.sceneDepth)
                 }
-                if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
-                    newConfig.frameSemantics.insert(.smoothedSceneDepth)
-                }
+                // ✅ OPTIMIZATION: Keep smoothedSceneDepth disabled for better performance
+                // if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
+                //     newConfig.frameSemantics.insert(.smoothedSceneDepth)
+                // }
 
                 // ✅ Run session on main thread (ARKit requirement)
                 DispatchQueue.main.async {
                     arView.session.run(newConfig, options: [.removeExistingAnchors])
                     print("✅ Scene reconstruction enabled - SLAM ready for scanning")
+
+                    // ✅ NEW: Log mesh reconstruction enabling for diagnostics
+                    self.diagnosticLogger.logMeshReconstructionEnabled()
                 }
             }
         }
@@ -297,11 +330,22 @@ struct ARScannerView: UIViewRepresentable {
 
             // ✅ LIMIT: Process max 20 anchors at a time
             var processed = 0
+            var meshAnchorsToAdd: [ARMeshAnchor] = []
             for anchor in anchors {
                 if let meshAnchor = anchor as? ARMeshAnchor {
-                    scanViewModel.addMeshAnchor(meshAnchor)
+                    meshAnchorsToAdd.append(meshAnchor)
+                    diagnosticLogger.logMeshAnchor(added: true)  // ✅ LOG
                     processed += 1
                     if processed >= 20 { break }
+                }
+            }
+
+            // ✅ CRITICAL FIX: Wrap mesh updates in @MainActor Task to prevent race condition
+            if !meshAnchorsToAdd.isEmpty {
+                Task { @MainActor in
+                    for meshAnchor in meshAnchorsToAdd {
+                        scanViewModel.addMeshAnchor(meshAnchor)
+                    }
                 }
             }
 
@@ -319,134 +363,154 @@ struct ARScannerView: UIViewRepresentable {
             lastMeshAnchorUpdate = now
 
             var processed = 0
+            var meshAnchorsToUpdate: [ARMeshAnchor] = []
             for anchor in anchors {
                 if let meshAnchor = anchor as? ARMeshAnchor {
-                    scanViewModel.updateMeshAnchor(meshAnchor)
+                    meshAnchorsToUpdate.append(meshAnchor)
                     processed += 1
                     if processed >= 20 { break }
+                }
+            }
+
+            // ✅ CRITICAL FIX: Wrap mesh updates in @MainActor Task to prevent race condition
+            if !meshAnchorsToUpdate.isEmpty {
+                Task { @MainActor in
+                    for meshAnchor in meshAnchorsToUpdate {
+                        scanViewModel.updateMeshAnchor(meshAnchor)
+                    }
                 }
             }
         }
 
         func session(_ session: ARSession, didUpdate frame: ARFrame) {
-            // ✅ FIXED: Extract data immediately, don't retain frame
+            // ✅ CRITICAL FIX: Extract all needed data immediately, don't retain frame
+            let trackingState = frame.camera.trackingState
+            let cameraTransform = frame.camera.transform
 
-            // Update tracking quality (fast, no retention)
-            updateTrackingQuality(frame: frame)
+            // ✅ LOG: Track frame updates (logger extracts its own data)
+            diagnosticLogger.logFrame(frame)
 
-            // ✅ METAL OPTIMIZATION: GPU-accelerated depth integration (throttled to 20 Hz)
-            let now = CACurrentMediaTime()
-            if scanViewModel.scanState == .scanning,
-               now - lastDepthIntegrationTime >= depthIntegrationInterval,
-               let cache = cvTextureCache,
-               let sceneDepth = frame.sceneDepth {
+            // ✅ FIX: Pass camera transform to ScanViewModel for movement detection
+            Task { @MainActor in
+                scanViewModel.updateCameraTransform(cameraTransform)
+            }
 
-                lastDepthIntegrationTime = now
+            // Update tracking quality (pass extracted data only)
+            updateTrackingQuality(trackingState: trackingState)
 
-                // Extract depth data immediately (don't capture frame)
-                let depthPixelBuffer = sceneDepth.depthMap
-                let _ = frame.camera.intrinsics  // TODO: Use for Metal TSDF integration
-                let _ = frame.camera.transform   // TODO: Use for Metal TSDF integration
+            // ❌ DISABLED: Metal depth integration causes ARFrame retention
+            // CVPixelBuffer (depth data) retains reference to ARFrame
+            // This Metal optimization path is disabled until we implement proper data copying
+            // See: https://developer.apple.com/documentation/arkit/arframe
 
-                // Convert depth pixel buffer to MTLTexture on background queue
-                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                    guard let self = self else { return }
+            // TODO: To re-enable Metal path, must copy CVPixelBuffer data to independent buffer
+            // let now = CACurrentMediaTime()
+            // if scanViewModel.scanState == .scanning, now - lastDepthIntegrationTime >= ... {
+            //     Copy pixel buffer data here, don't just reference it
+            // }
 
-                    let width = CVPixelBufferGetWidth(depthPixelBuffer)
-                    let height = CVPixelBufferGetHeight(depthPixelBuffer)
-                    var cvMetalTex: CVMetalTexture?
-
-                    // Create MTLTexture from CVPixelBuffer using the cached converter
-                    let status = CVMetalTextureCacheCreateTextureFromImage(
-                        kCFAllocatorDefault,
-                        cache,
-                        depthPixelBuffer,
-                        nil,
-                        .r32Float, // Float32 depth format
-                        width,
-                        height,
-                        0,
-                        &cvMetalTex
-                    )
-
-                    if status == kCVReturnSuccess,
-                       let cvTex = cvMetalTex,
-                       let _ = CVMetalTextureGetTexture(cvTex) {
-
-                        // ✅ SUCCESS: We have an MTLTexture backed by the depth buffer
-                        // TODO: Integrate with TSDFMetalVolume when available
-                        // let depthTexture = CVMetalTextureGetTexture(cvTex)
-                        // Example: tsdfMetal?.integrateDepth(depthTexture: depthTexture,
-                        //                                    intrinsics: intrinsics,
-                        //                                    cameraTransform: cameraTransform,
-                        //                                    weightScale: 1.0)
-
-                        // For now, just log success (remove when Metal TSDF is integrated)
-                        // print("✅ Depth texture created: \(width)×\(height)")
-                    } else {
-                        // Texture creation failed - continue with CPU path below
-                        if frameCounter % 30 == 0 { // Log occasionally to avoid spam
-                            print("⚠️ CVMetalTextureCacheCreateTextureFromImage failed: \(status)")
-                        }
-                    }
+            // ✅ AI: Process frame for object detection (runs even when not scanning)
+            if scanViewModel.aiEnabled && scanViewModel.aiCoordinator.featureFlags.autoDetection {
+                // Run YOLO detection at lower frequency to avoid overhead
+                if frameCounter % 30 == 0, let arView = arView {
+                    scanViewModel.aiCoordinator.processFrameForDetection(frame: frame, arView: arView)
                 }
             }
 
             // Early exit if not scanning
-            guard scanViewModel.scanState == .scanning else { return }
+            guard scanViewModel.scanState == .scanning else {
+                // Reset scan start time when not scanning
+                if scanStartTime != nil {
+                    scanStartTime = nil
+                    meshAnchorCheckTimer?.invalidate()
+                    meshAnchorCheckTimer = nil
+                }
+                return
+            }
 
             // Throttle to every 5th frame (was 3rd - reducing load for SLAM)
             frameCounter += 1
             guard frameCounter % 5 == 0 else { return }
 
-            // Run segmentation when an object is selected
-            guard scanViewModel.isObjectSelected else { return }
+            // ✅ DIAGNOSTIC: Monitor mesh anchor status (for logging only)
+            checkMeshAnchorStatus()
 
-            // ✅ CRITICAL FIX: Prevent task stacking - only one segmentation at a time
-            guard !isProcessingSegmentation else {
-                // Segmentation already running, skip this frame to prevent memory buildup
-                return
-            }
+            // ✅ PRIMARY: Use depth-based extraction ALWAYS (not as fallback)
+            if useDepthPrimary {
+                // ✅ CRITICAL FIX: Prevent task stacking to avoid ARFrame retention
+                if frameCounter % 10 == 0,  // Process depth every 10th frame (less frequent)
+                   !isProcessingDepthFallback,  // ✅ FIX: Only if previous task finished
+                   let sceneDepth = frame.sceneDepth {  // ✅ Check depth availability
 
-            // ✅ CRITICAL FIX: Extract pixel buffer NOW, don't pass frame to closures
-            let pixelBuffer = frame.capturedImage
+                    // ✅ CRITICAL FIX: Copy CVPixelBuffer data IMMEDIATELY to avoid ARFrame retention
+                    // CVPixelBuffers internally retain the ARFrame - we must copy the raw data first
+                    let cameraTransform = frame.camera.transform
+                    let intrinsics = frame.camera.intrinsics
 
-            // Mark as processing
-            isProcessingSegmentation = true
-
-            // ✅ CRITICAL: Use weak self, don't capture frame
-            Task { [weak self] in
-                guard let self = self else {
-                    self?.isProcessingSegmentation = false
-                    return
-                }
-
-                self.segmentationFilter.segment(pixelBuffer: pixelBuffer, orientation: .right) { [weak self] mask in
-                    guard let self = self, let mask = mask else {
-                        self?.isProcessingSegmentation = false
-                        return
+                    // Copy depth data synchronously (this releases the frame)
+                    guard let copiedDepthData = copyDepthDataSync(
+                        depthMap: sceneDepth.depthMap,
+                        confidenceMap: sceneDepth.confidenceMap
+                    ) else {
+                        return  // Failed to copy data
                     }
 
-                    self.lastSegmentationMask = mask
+                    // ✅ ARFrame is now released! Process copied data asynchronously
+                    isProcessingDepthFallback = true
+                    let shouldLog = frameCounter % 50 == 0
 
-                    let coverage = self.segmentationFilter.calculateCoverage(mask: mask)
+                    Task { @MainActor [weak self] in
+                        guard let self = self else { return }
 
-                    Task { @MainActor in
-                        self.scanViewModel.segmentationCoverage = coverage
+                        defer {
+                            self.isProcessingDepthFallback = false
+                        }
+
+                        // Extract points from copied data (no frame retention)
+                        if let result = self.depthExtractor.extractPointsFromCopiedData(
+                            depthData: copiedDepthData.depthValues,
+                            confidenceData: copiedDepthData.confidenceValues,
+                            width: copiedDepthData.width,
+                            height: copiedDepthData.height,
+                            cameraTransform: cameraTransform,
+                            intrinsics: intrinsics,
+                            samplingRate: self.depthExtractor.depthSamplingRate,
+                            minDepth: self.depthExtractor.minDepth,
+                            maxDepth: self.depthExtractor.maxDepth,
+                            minConfidence: self.depthExtractor.minConfidence
+                        ) {
+                            self.scanViewModel.integrateDepthPoints(
+                                points: result.points,
+                                normals: result.normals,
+                                confidence: result.confidence
+                            )
+
+                            if shouldLog {
+                                print("📊 PRIMARY depth extraction - Points: \(result.points.count)")
+                            }
+                        }
                     }
-
-                    // Mark as done
-                    self.isProcessingSegmentation = false
                 }
             }
+
+            // ❌ DISABLED: Segmentation causes ARFrame retention via CVPixelBuffer
+            // CVPixelBuffer (captured image & segmentation mask) retains reference to ARFrame
+            // Segmentation is disabled to prevent memory leaks
+
+            // TODO: To re-enable segmentation:
+            // 1. Copy CVPixelBuffer data to independent buffer immediately
+            // 2. Release original pixelBuffer before async processing
+            // 3. Don't store lastSegmentationMask (it retains frames)
+
+            // Segmentation code disabled:
+            // guard scanViewModel.isObjectSelected else { return }
+            // guard !isProcessingSegmentation else { return }
+            // ...
 
             // ✅ Frame released here - no retention!
         }
 
-        private func updateTrackingQuality(frame: ARFrame) {
-            let camera = frame.camera
-            let trackingState = camera.trackingState
-
+        private func updateTrackingQuality(trackingState: ARCamera.TrackingState) {
             switch trackingState {
             case .normal:
                 scanViewModel.trackingQuality = .good
@@ -458,6 +522,38 @@ struct ARScannerView: UIViewRepresentable {
                 scanViewModel.trackingQuality = .limited
             @unknown default:
                 scanViewModel.trackingQuality = .limited
+            }
+        }
+
+        /// Monitor mesh anchor arrival for diagnostic purposes only
+        private func checkMeshAnchorStatus() {
+            // Start timer when scanning begins
+            if scanStartTime == nil, scanViewModel.scanState == .scanning {
+                scanStartTime = Date()
+                print("⏱️ Scan started - PRIMARY depth extraction + mesh anchors (if available)")
+
+                // Schedule diagnostic check after 5 seconds to log mesh anchor status
+                meshAnchorCheckTimer?.invalidate()
+                meshAnchorCheckTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: false) { [weak self] _ in
+                    guard let self = self else { return }
+
+                    Task { @MainActor in
+                        if self.scanViewModel.meshAnchors.isEmpty {
+                            print("ℹ️ No mesh anchors after 5s - continuing with DEPTH-ONLY mode")
+                            print("   📊 DIAGNOSTIC: VIO not initialized, but depth extraction working")
+                            self.diagnosticLogger.logDepthFallbackEnabled()  // ✅ LOG
+
+                            // Inform user that scanning is working via depth data
+                            var recs = self.scanViewModel.recommendations
+                            recs.append("✅ Scanning mit LiDAR-Tiefendaten (funktioniert)")
+                            self.scanViewModel.recommendations = recs
+                        } else {
+                            print("✅ Mesh anchors detected (\(self.scanViewModel.meshAnchors.count)) - hybrid mode active")
+                            print("   📊 Using both depth extraction AND mesh anchors for maximum quality")
+                        }
+                    }
+                }
+                RunLoop.main.add(meshAnchorCheckTimer!, forMode: .common)
             }
         }
 
@@ -502,14 +598,14 @@ struct ARScannerView: UIViewRepresentable {
             // Clear mesh visualization
             clearMeshVisualization(arView: arView)
 
-            // Show bounding box
+            // Show bounding box (only create once dimensions are valid)
             if boundingBoxEntity == nil {
                 let dimensions = scanViewModel.dimensions
 
-                // ✅ CRITICAL: Validate dimensions before conversion
+                // ✅ CRITICAL: Validate dimensions before conversion (silent return - will retry next frame)
                 guard dimensions.x.isFinite && dimensions.y.isFinite && dimensions.z.isFinite,
                       dimensions.x > 0 && dimensions.y > 0 && dimensions.z > 0 else {
-                    print("⚠️ Invalid dimensions for bounding box: \(dimensions)")
+                    // Dimensions not ready yet - will retry when updateVisualization is called again
                     return
                 }
 
@@ -547,6 +643,74 @@ struct ARScannerView: UIViewRepresentable {
         private func clearBoundingBoxVisualization(arView: ARView) {
             boundingBoxEntity?.removeFromParent()
             boundingBoxEntity = nil
+        }
+
+        // MARK: - CVPixelBuffer Data Copying
+
+        /// Copied depth data (no CVPixelBuffer retention)
+        struct CopiedDepthData {
+            let depthValues: [Float]
+            let confidenceValues: [UInt8]?
+            let width: Int
+            let height: Int
+        }
+
+        /// ✅ CRITICAL: Copy CVPixelBuffer data immediately to prevent ARFrame retention
+        /// CVPixelBuffers internally hold references to ARFrame - must copy raw data
+        private func copyDepthDataSync(
+            depthMap: CVPixelBuffer,
+            confidenceMap: CVPixelBuffer?
+        ) -> CopiedDepthData? {
+            CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+
+            let width = CVPixelBufferGetWidth(depthMap)
+            let height = CVPixelBufferGetHeight(depthMap)
+
+            guard let depthBuffer = CVPixelBufferGetBaseAddress(depthMap) else {
+                return nil
+            }
+
+            // Copy depth values to independent array
+            let totalPixels = width * height
+            var depthValues: [Float] = []
+            depthValues.reserveCapacity(totalPixels)
+
+            for i in 0..<totalPixels {
+                let depth = depthBuffer.load(
+                    fromByteOffset: i * MemoryLayout<Float32>.stride,
+                    as: Float32.self
+                )
+                depthValues.append(depth)
+            }
+
+            // Copy confidence values if available
+            var confidenceValues: [UInt8]?
+            if let confMap = confidenceMap {
+                CVPixelBufferLockBaseAddress(confMap, .readOnly)
+                defer { CVPixelBufferUnlockBaseAddress(confMap, .readOnly) }
+
+                if let confBuffer = CVPixelBufferGetBaseAddress(confMap) {
+                    var confArray: [UInt8] = []
+                    confArray.reserveCapacity(totalPixels)
+
+                    for i in 0..<totalPixels {
+                        let conf = confBuffer.load(
+                            fromByteOffset: i * MemoryLayout<UInt8>.stride,
+                            as: UInt8.self
+                        )
+                        confArray.append(conf)
+                    }
+                    confidenceValues = confArray
+                }
+            }
+
+            return CopiedDepthData(
+                depthValues: depthValues,
+                confidenceValues: confidenceValues,
+                width: width,
+                height: height
+            )
         }
 
         // MARK: - Entity Creation

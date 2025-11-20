@@ -171,7 +171,16 @@ class LiveVolumeEstimator {
         let volumeCm3 = volumeMeters * 1_000_000.0
 
         // Apply fill factor (objects rarely fill entire bounding box)
-        return volumeCm3 * fillFactor
+        var estimatedVolume = volumeCm3 * fillFactor
+
+        // ✅ CRITICAL FIX: Apply calibration scale factor
+        // Volume scales with the cube of linear scale factor (V = L³)
+        if let calibrationFactor = CalibrationManager.shared.calibrationFactor {
+            let volumeScaleFactor = pow(Double(calibrationFactor), 3.0)
+            estimatedVolume *= volumeScaleFactor
+        }
+
+        return estimatedVolume
     }
 
     /// Calculate stability based on recent estimate variance

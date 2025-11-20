@@ -91,9 +91,18 @@ class MeshVolumeCalculator {
         // Calculate surface area
         let surfaceArea = calculateSurfaceArea(triangles: allTriangles)
 
+        // ✅ CRITICAL FIX: Apply calibration scale factor
+        // Volume scales with the cube of linear scale factor (V = L³)
+        var calibratedVolume_m3 = volume_m3
+        if let calibrationFactor = CalibrationManager.shared.calibrationFactor {
+            let volumeScaleFactor = pow(Double(calibrationFactor), 3.0)
+            calibratedVolume_m3 = volume_m3 * volumeScaleFactor
+            print("📏 Calibration applied: raw=\(String(format: "%.2f", volume_m3 * 1_000_000)) cm³ → calibrated=\(String(format: "%.2f", calibratedVolume_m3 * 1_000_000)) cm³ (factor=\(String(format: "%.3f", calibrationFactor)))")
+        }
+
         return MeshVolumeResult(
-            volume_m3: volume_m3,
-            volume_cm3: volume_m3 * 1_000_000,
+            volume_m3: calibratedVolume_m3,
+            volume_cm3: calibratedVolume_m3 * 1_000_000,
             surfaceArea_m2: surfaceArea,
             method: method,
             quality: quality,
@@ -288,10 +297,23 @@ class MeshVolumeCalculator {
             // Extract vertices directly from buffer (avoid actor-isolated method)
             let verticesBuffer = geometry.vertices.buffer.contents()
             let verticesStride = geometry.vertices.stride
+            let vertexBufferLength = geometry.vertices.buffer.length
 
             for i in 0..<vertexCount {
-                let vertexPointer = verticesBuffer.advanced(by: i * verticesStride)
+                let offset = i * verticesStride
+
+                // ✅ CRITICAL: Prevent buffer overflow
+                guard offset + MemoryLayout<SIMD3<Float>>.size <= vertexBufferLength else {
+                    break
+                }
+
+                let vertexPointer = verticesBuffer.advanced(by: offset)
                 let localVertex = vertexPointer.assumingMemoryBound(to: SIMD3<Float>.self).pointee
+
+                // Validate vertex data
+                guard localVertex.x.isFinite && localVertex.y.isFinite && localVertex.z.isFinite else {
+                    continue
+                }
 
                 // Transform to world space
                 let worldVertex = transform * SIMD4<Float>(localVertex.x, localVertex.y, localVertex.z, 1.0)
@@ -301,9 +323,15 @@ class MeshVolumeCalculator {
             // Get faces (triangles)
             let faceCount = geometry.faces.count
             let facesPointer = geometry.faces.buffer.contents()
+            let facesBufferLength = geometry.faces.buffer.length
 
             for faceIndex in 0..<faceCount {
                 let offset = faceIndex * geometry.faces.indexCountPerPrimitive * geometry.faces.bytesPerIndex
+
+                // ✅ CRITICAL: Prevent buffer overflow
+                guard offset + (3 * MemoryLayout<UInt32>.size) <= facesBufferLength else {
+                    break
+                }
 
                 let i0 = facesPointer.advanced(by: offset).assumingMemoryBound(to: UInt32.self).pointee
                 let i1 = facesPointer.advanced(by: offset + 4).assumingMemoryBound(to: UInt32.self).pointee
